@@ -1,25 +1,50 @@
 import pandas as pd
 import numpy as np
+import os
 import psycopg2 as pg
 import pandas.io.sql as pd_sql
 from sklearn.linear_model import LogisticRegression
 from sklearn.preprocessing import MinMaxScaler
 import xgboost as xgb
 
-from .lw_pickle import var_to_pickle
-from .val_by_group import train_test_by_group
-
-# xgboost fix
-#import os
-#os.environ['KMP_DUPLICATE_LIB_OK']='True'
+from lw_pickle import var_to_pickle
+from val_by_group import train_test_by_group
 
 
 class build_models:
+    '''
+    Acquires instacart data from SQL database, engineers features, and uses data
+    to train logistic regression and gradient boosting tree models. This script
+    is designed to be run locally and remotely on a cloud instance, either
+    through a Jupyter Notebook or the command line.
+    '''
+
+    # Sets variables for id, y, and X columns
+    id_col = 'user_id'
+    y_col = 'in_cart'
+    x_cols = ['percent_in_user_orders',
+              'percent_in_all_orders',
+              'in_last_cart',
+              'in_last_five',
+              'total_user_orders',
+              'mean_orders_between',
+              'mean_days_between',
+              'orders_since_newest',
+              'days_since_newest',
+              'product_reorder_proba',
+              'user_reorder_proba',
+              'mean_cart_size',
+              'mean_cart_percentile',
+              'mean_hour_of_week',
+              'newest_cart_size',
+              'newest_hour_of_week',
+              'cart_size_difference',
+              'hour_of_week_difference']
 
     def __init__(self, user_limit=-1):
         '''
-        Initializes variables, then runs all steps from querying database
-        through pickling trained models
+        Initializes variables and runs all steps from querying database through
+        pickling trained models
 
         Args:
             user_limit (int): limits the query to the first user_limit users,
@@ -29,9 +54,13 @@ class build_models:
             None
         '''
         self.user_limit = user_limit
-        self.train_df = None
+        self.newest_df = None
         self.prior_df = None
         self.df = None
+        self.train_df = None
+        self.test_df = None
+        self.lrm = None
+        self.gbm = None
         print(self.run())
 
     def run(self):
@@ -46,6 +75,8 @@ class build_models:
         '''
         if self.query_db():
             return 'Failed to create dataframes from SQL database'
+        print('Queried SQL database and created dataframes')
+
         # Still need to fully implement error checking for these functions
         self.merge_cart_df()
         self.feature_target()
@@ -53,6 +84,23 @@ class build_models:
         self.feature_rate_overall()
         self.feature_in_last_cart()
         self.feature_time_since_order()
+        self.feature_product_proba()
+        self.feature_user_proba()
+        self.feature_mean_order()
+        self.feature_newest_order()
+        print('Engineered all features')
+
+        self.train_test_split()
+        print('Split data into train and test sets')
+
+        self.model_log_reg()
+        print('Trained logistic regression model')
+
+        self.model_grad_boost()
+        print('Trained gradient boosting decision tree model')
+
+        self.save_to_files()
+        print('Saved test set and models to files')
 
         return 'Success'
 
@@ -112,7 +160,7 @@ class build_models:
             INNER JOIN orders ON orderstrain.order_id = orders.order_id
             %s
         ''' % (cols, query_end)
-        self.train_df = pd_sql.read_sql(query, connection)
+        self.newest_df = pd_sql.read_sql(query, connection)
 
         # Reads from Prior Orders Table
         query = '''
@@ -139,7 +187,7 @@ class build_models:
                            .agg({'order_id':'nunique'})
                            .rename(columns={'order_id':'count_in_user_orders'})
         )
-        train_users = self.train_df['user_id'].unique()
+        train_users = self.newest_df['user_id'].unique()
         df = df[df['user_id'].isin(train_users)]
         df.reset_index(drop=True, inplace=True)
         self.df = df
@@ -156,9 +204,9 @@ class build_models:
         Returns:
             bool: None if successful, True if an error occurred
         '''
-        feat_df = (self.train_df.groupby('user_id')
-                                .agg({'product_id':(lambda x: set(x))})
-                                .rename(columns={'product_id':'cart_contents'})
+        feat_df = (self.newest_df.groupby('user_id')
+                                 .agg({'product_id':(lambda x: set(x))})
+                                 .rename(columns={'product_id':'cart_contents'})
         )
 
         df = self.df.merge(feat_df, on='user_id')
@@ -248,9 +296,11 @@ class build_models:
     def feature_time_since_order(self):
         '''
         Adds a dataframe column for the following time-related features:
-        * days between product orders
-        * orders between product orders
-        * times product appears in last five orders
+        * mean orders between product orders
+        * mean days between product orders
+        * number of orders since most recent product order
+        * number of days since most recent product order
+        * number of orders in the last five that include a product
 
         Args:
             None
@@ -258,198 +308,356 @@ class build_models:
         Returns:
             bool: None if successful, True if an error occurred
         '''
-        since_first_df = (orders_prior_df.groupby(['user_id', 'order_id'], as_index=False)
-                                         .agg({'order_number':'first',
-                                               'days_since_prior_order':'first'}))
-        since_first_df = (since_first_df.drop('days_since_prior_order', axis=1)
-                                        .merge(since_first_df.drop('order_id', axis=1),
-                                                                   how='left',
-                                                                   on='user_id'))
+        # Creates a dataframe that has rows containing every user order with
+        # every user days_since_prior_order value
+        since_first_df =\
+        (self.prior_df.groupby(['user_id', 'order_id'], as_index=False)
+                      .agg({'order_number':'first',
+                            'days_since_prior_order':'first'})
+        )
+        since_first_df =\
+        (since_first_df.drop('days_since_prior_order', axis=1)
+                       .merge(since_first_df.drop('order_id', axis=1),
+                              how='left',
+                              on='user_id')
+        )
 
-        mask = since_first_df['order_number_x'] <= since_first_df['order_number_y']
-        since_newest_df = since_first_df[mask].drop(['user_id', 'order_number_y'], axis=1)
-        since_newest_df = (since_newest_df.groupby(['order_id', 'order_number_x'],
-                                                   as_index=False)['days_since_prior_order'].sum())
+        # Splits off a new dataframe that has a column containing days since
+        # the most recent order for every order
+        mask = (since_first_df['order_number_x'] <=
+                since_first_df['order_number_y']
+        )
+        since_newest_df =\
+        since_first_df[mask].drop(['user_id', 'order_number_y'], axis=1)
+        since_newest_df =\
+        (since_newest_df.groupby(['order_id', 'order_number_x'], as_index=False)
+        ['days_since_prior_order'].sum()
+        )
         since_newest_df.drop('order_number_x', axis=1, inplace=True)
-        since_newest_df.rename(columns={'days_since_prior_order':'days_since_newest'}, inplace=True)
+        since_newest_df.rename(columns={'days_since_prior_order':
+                                        'days_since_newest'}, inplace=True)
 
-        mask = since_first_df['order_number_x'] >= since_first_df['order_number_y']
-        since_first_df = since_first_df[mask].drop(['user_id', 'order_number_y'], axis=1)
-        since_first_df = (since_first_df.groupby(['order_id', 'order_number_x'],
-                                                 as_index=False)['days_since_prior_order'].sum())
-        since_first_df.rename(columns={'days_since_prior_order':'days_since_first_order',
-                                       'order_number_x':'order_number'}, inplace=True)
+        # Finishes since_first_df so that it has a column containing days since
+        # the first order for every order
+        mask = (since_first_df['order_number_x'] >=
+                since_first_df['order_number_y']
+        )
+        since_first_df =\
+        since_first_df[mask].drop(['user_id', 'order_number_y'], axis=1)
+        since_first_df =\
+        (since_first_df.groupby(['order_id', 'order_number_x'], as_index=False)
+        ['days_since_prior_order'].sum()
+        )
+        since_first_df.rename(columns={'days_since_prior_order':
+                                       'days_since_first_order',
+                                       'order_number_x':'order_number'},
+                                       inplace=True)
 
+        # Creates a dataframe containing the most recent order number for every
+        # user
         newest_cart_df =\
-            (orders_train_df.groupby(['user_id'])[['order_number', 'days_since_prior_order']]
-                            .first()
-                            .rename(columns={'order_number':'newest_order_number'}))
+        (self.newest_df.groupby(['user_id'])[['order_number',
+                                              'days_since_prior_order']]
+                       .first()
+                       .rename(columns={'order_number':'newest_order_number'})
+        )
 
-        orders_since_df = orders_prior_df[['user_id', 'order_id', 'product_id']]
-        orders_since_df = orders_since_df.merge(since_first_df, how='left', on='order_id')
-        orders_since_df = orders_since_df.merge(since_newest_df, how='left', on='order_id')
-        orders_since_df = orders_since_df.merge(newest_cart_df, how='left', on='user_id')
-        since_first_df = since_newest_df = newest_cart_df = None
+        # Creates a new dataframe that combines the original prior_df with the
+        # newly-created dataframes containing days since first order, days since
+        # most recent order, and most recent order number per user
+        orders_since_df = self.prior_df[['user_id', 'order_id', 'product_id']]
+        orders_since_df =\
+        orders_since_df.merge(since_first_df, how='left', on='order_id')
+        orders_since_df =\
+        orders_since_df.merge(since_newest_df, how='left', on='order_id')
+        orders_since_df =\
+        orders_since_df.merge(newest_cart_df, how='left', on='user_id')
 
-        orders_since_df['days_since_newest'] += orders_since_df['days_since_prior_order']
-        orders_since_df['orders_since_newest'] = (orders_since_df['newest_order_number'] -
-                                                  orders_since_df['order_number'])
+        orders_since_df['days_since_newest'] +=\
+        orders_since_df['days_since_prior_order']
 
-        mask = orders_since_df['order_number'] >= (orders_since_df['newest_order_number'] - 5)
+        orders_since_df['orders_since_newest'] =\
+        (orders_since_df['newest_order_number'] -
+        orders_since_df['order_number']
+        )
+
+        # Creates and merges a dataframe containing whether or not a product
+        # appears in the last five user orders
+        mask = (orders_since_df['order_number'] >=
+                (orders_since_df['newest_order_number'] - 5)
+        )
         last_five_df =\
-            (orders_since_df[mask].groupby(['user_id', 'product_id'], as_index=False)['order_id']
-                                  .count()
-                                  .rename(columns={'order_id':'in_last_five'}))
+        (orders_since_df[mask].groupby(['user_id', 'product_id'],
+                                       as_index=False)['order_id']
+                              .count()
+                              .rename(columns={'order_id':'in_last_five'})
+        )
         orders_since_df = orders_since_df.merge(last_five_df,
                                                 how='left',
                                                 on=['user_id', 'product_id'])
-        orders_since_df['in_last_five'] = orders_since_df['in_last_five'].fillna(0).astype(int)
-        last_five_df = None
+        orders_since_df['in_last_five'] =\
+        orders_since_df['in_last_five'].fillna(0).astype(int)
 
-        orders_since_df.sort_values(by=['user_id', 'product_id', 'order_number'], inplace=True)
+        orders_since_df.sort_values(by=['user_id',
+                                        'product_id',
+                                        'order_number'], inplace=True)
         orders_since_df.reset_index(drop=True, inplace=True)
 
+        # Adds columns to orders_since_df for the mean days between when an item
+        # is reordered and the mean orders between when an item is reordered
         orders_since_df['last_order_number'] =\
-            orders_since_df.groupby(['user_id', 'product_id'])['order_number'].shift(1)
+        (orders_since_df.groupby(['user_id', 'product_id'])['order_number']
+                        .shift(1)
+        )
         orders_since_df['last_days_since_first_order'] =\
-            orders_since_df.groupby(['user_id', 'product_id'])['days_since_first_order'].shift(1)
+        (orders_since_df.groupby(['user_id', 'product_id'])
+        ['days_since_first_order'].shift(1)
+        )
         orders_since_df['mean_orders_between'] =\
-            orders_since_df['order_number'] - orders_since_df['last_order_number']
+        orders_since_df['order_number'] - orders_since_df['last_order_number']
         orders_since_df['mean_days_between'] =\
-            orders_since_df['days_since_first_order'] - orders_since_df['last_days_since_first_order']
+        (orders_since_df['days_since_first_order'] -
+        orders_since_df['last_days_since_first_order']
+        )
 
-        (orders_since_df['mean_orders_between'].fillna(orders_since_df['orders_since_newest'],
-                                                       inplace=True))
-        (orders_since_df['mean_days_between'].fillna(orders_since_df['days_since_newest'],
-                                                     inplace=True))
+        (orders_since_df['mean_orders_between']
+        .fillna(orders_since_df['orders_since_newest'], inplace=True)
+        )
+        (orders_since_df['mean_days_between']
+        .fillna(orders_since_df['days_since_newest'], inplace=True)
+        )
 
-        orders_since_df = (orders_since_df.groupby(['user_id', 'product_id'], as_index=False)
-                                          .agg({'mean_orders_between':'mean',
-                                                'mean_days_between':'mean',
-                                                'orders_since_newest':'last',
-                                                'days_since_newest':'last',
-                                                'in_last_five':'last'}))
-        orders_since_df.rename({'order_number':'latest_order_number'}, inplace=True)
+        # Merges new features back into the main dataframe
+        orders_since_df =\
+        (orders_since_df.groupby(['user_id', 'product_id'], as_index=False)
+                        .agg({'mean_orders_between':'mean',
+                              'mean_days_between':'mean',
+                              'orders_since_newest':'last',
+                              'days_since_newest':'last',
+                              'in_last_five':'last'})
+        )
+        orders_since_df.rename({'order_number':'latest_order_number'},
+                               inplace=True)
 
-        df = df.merge(orders_since_df, how='left', on=['user_id', 'product_id'])
-        orders_since_df = None
-'''
-# Feature: Likelihood a Product Gets Reordered
-product_proba_df = (orders_prior_df.groupby('product_id', as_index=False)
-                                   .agg({'user_id':'nunique', 'order_id':'count'}))
-product_proba_df['product_reorder_proba'] = 1 - (product_proba_df['user_id'] /
-                                                 product_proba_df['order_id'])
-product_proba_df.drop(['user_id', 'order_id'], axis=1, inplace=True)
-df = df.merge(product_proba_df, how='left', on='product_id')
-product_proba_df = None
+        df = self.df.merge(orders_since_df,
+                           how='left',
+                           on=['user_id', 'product_id'])
+        self.df = df
+        return None
 
-# Feature: Likelihood a User Reorders Any Product
-user_proba_df = (orders_prior_df.groupby('user_id', as_index=False)
-                                .agg({'product_id':'nunique', 'order_id':'count'}))
-user_proba_df['user_reorder_proba'] = 1 - (user_proba_df['product_id'] /
-                                           user_proba_df['order_id'])
-user_proba_df.drop(['product_id', 'order_id'], axis=1, inplace=True)
-df = df.merge(user_proba_df, how='left', on='user_id')
-product_proba_df = None
+    def feature_product_proba(self):
+        '''
+        Adds a dataframe column for the feature probability a product gets
+        reordered
 
-# Feature: Average Hour of Week, Order Size, and Add Order Percentile for Prior Orders
-hour_of_week_df = (orders_prior_df.groupby('order_id')
-                                  .agg({'order_dow':'first',
-                                        'order_hour_of_day':'first',
-                                        'add_to_cart_order':'max'})
-                                  .rename(columns={'add_to_cart_order':'mean_cart_size'}))
-hour_of_week_df['mean_hour_of_week'] = (hour_of_week_df['order_dow'] * 24 +
-                                        hour_of_week_df['order_hour_of_day'])
-hour_of_week_df.drop(['order_dow', 'order_hour_of_day'], axis=1, inplace=True)
+        Args:
+            None
 
-percentile_df = (orders_prior_df[['user_id', 'order_id', 'product_id', 'add_to_cart_order']]
-                 .merge(hour_of_week_df, how='left', on='order_id'))
-percentile_df['mean_cart_percentile'] = (1 - (percentile_df['add_to_cart_order'] - 1) /
-                                         percentile_df['mean_cart_size'])
-percentile_df = (percentile_df.groupby(['user_id', 'product_id'])
-                              .agg({'mean_cart_size':'mean',
-                                    'mean_cart_percentile':'mean',
-                                    'mean_hour_of_week':'mean'}))
+        Returns:
+            bool: None if successful, True if an error occurred
+        '''
+        feat_df = (self.prior_df.groupby('product_id', as_index=False)
+                                .agg({'user_id':'nunique', 'order_id':'count'}))
+        feat_df['product_reorder_proba'] = 1 - (feat_df['user_id'] /
+                                                feat_df['order_id'])
+        feat_df.drop(['user_id', 'order_id'], axis=1, inplace=True)
+        df = self.df.merge(feat_df, how='left', on='product_id')
+        self.df = df
+        return None
 
-df = df.merge(percentile_df, how='left', on=['user_id', 'product_id'])
-hour_of_week_df = percentile_df = None
+    def feature_user_proba(self):
+        '''
+        Adds a dataframe column for the feature probability a user reorders any
+        product
 
-# Feature: Hour of Week and Number of Items in Newest Order
-hour_of_week_df = (orders_train_df.groupby('user_id')
-                                  .agg({'order_dow':'first',
-                                        'order_hour_of_day':'first',
-                                        'add_to_cart_order':'max'})
-                                  .rename(columns={'add_to_cart_order':'newest_cart_size'}))
-hour_of_week_df['newest_hour_of_week'] = (hour_of_week_df['order_dow'] * 24 +
-                                          hour_of_week_df['order_hour_of_day'])
-hour_of_week_df.drop(['order_dow', 'order_hour_of_day'], axis=1, inplace=True)
+        Args:
+            None
 
-df = df.merge(hour_of_week_df, how='left', on=['user_id'])
-hour_of_week_df = None
+        Returns:
+            bool: None if successful, True if an error occurred
+        '''
+        feat_df =\
+        (self.prior_df.groupby('user_id', as_index=False)
+                      .agg({'product_id':'nunique', 'order_id':'count'})
+        )
+        feat_df['user_reorder_proba'] = 1 - (feat_df['product_id'] /
+                                             feat_df['order_id'])
+        feat_df.drop(['product_id', 'order_id'], axis=1, inplace=True)
+        df = self.df.merge(feat_df, how='left', on='user_id')
+        self.df = df
+        return None
 
-# Feature: Absolute Difference in Cart Size, Hour of Week, Hour, and Day
-df['cart_size_difference'] = np.abs(df['mean_cart_size'] - df['newest_cart_size'])
-df['hour_of_week_difference'] = np.abs(df['mean_hour_of_week'] - df['newest_hour_of_week'])
-print('Engineered Features')
+    def feature_mean_order(self):
+        '''
+        Adds a dataframe column for the following mean order features:
+        * mean cart size for carts containing product
+        * mean add order percentile for carts containing product
+        * mean hour of week of orders containing product
 
-# Split Into Train, Validate, and Test Sets
-group_col = 'user_id'
-x_cols = ['percent_in_user_orders',
-          'percent_in_all_orders',
-          'in_last_cart',
-          'in_last_five',
-          'total_user_orders',
-          'mean_orders_between',
-          'mean_days_between',
-          'orders_since_newest',
-          'days_since_newest',
-          'product_reorder_proba',
-          'user_reorder_proba',
-          'mean_cart_size',
-          'mean_cart_percentile',
-          'mean_hour_of_week',
-          'newest_cart_size',
-          'newest_hour_of_week',
-          'cart_size_difference',
-          'hour_of_week_difference'
-         ]
-y_col = 'in_cart'
+        Args:
+            None
 
-train_df, test_df = train_test_by_group(df, group_col, test_size=.1)
-print('Created Train-Test Split')
+        Returns:
+            bool: None if successful, True if an error occurred
+        '''
+        # Calculates hour of week for each order
+        hour_df = (self.prior_df.groupby('order_id')
+                                .agg({'order_dow':'first',
+                                      'order_hour_of_day':'first',
+                                      'add_to_cart_order':'max'})
+                                .rename(columns={'add_to_cart_order':
+                                                 'mean_cart_size'})
+        )
+        hour_df['mean_hour_of_week'] = (hour_df['order_dow'] * 24 +
+                                        hour_df['order_hour_of_day'])
+        hour_df.drop(['order_dow', 'order_hour_of_day'], axis=1, inplace=True)
 
-# Scale Features
-scl = MinMaxScaler()
-X_train = scl.fit_transform(train_df[x_cols].values)
-X_test = scl.transform(test_df[x_cols].values)
-test_df.reset_index(drop=True, inplace=True)
-for name, col in zip(x_cols, np.transpose(X_test)):
-    test_df.loc[:, name] = col
-print('Scaled Features')
+        # Calculates mean cart size, add order percentile, and order hour
+        feat_df = (self.prior_df[['user_id',
+                                  'order_id',
+                                  'product_id',
+                                  'add_to_cart_order']]
+                       .merge(hour_df, how='left', on='order_id'))
+        feat_df['mean_cart_percentile'] =\
+        1 - (feat_df['add_to_cart_order'] - 1) / feat_df['mean_cart_size']
+        feat_df = (feat_df.groupby(['user_id', 'product_id'])
+                          .agg({'mean_cart_size':'mean',
+                                'mean_cart_percentile':'mean',
+                                'mean_hour_of_week':'mean'}))
 
-# Logistic Regression
-lr = LogisticRegression(C=10, solver='lbfgs', multi_class='auto', max_iter=2000)
-lr.fit(X_train, train_df[y_col])
-print('Trained Logistic Regression')
+        df = self.df.merge(feat_df, how='left', on=['user_id', 'product_id'])
+        self.df = df
+        return None
 
-# XGBoost
-gbm = xgb.XGBClassifier(n_estimators=10000,
-                        max_depth=3,
-                        objective="binary:logistic",
-                        learning_rate=.5,
-                        subsample=.08,
-                        min_child_weight=.5,
-                        colsample_bytree=.8)
-gbm.fit(X_train, train_df[y_col],
-        eval_set=[(X_train, train_df[y_col])],
-        eval_metric='auc',
-        early_stopping_rounds=20,
-        verbose=False)
-print('Trained XGBoost')
+    def feature_newest_order(self):
+        '''
+        Adds a dataframe column for the following features:
+        * hour of week of most recent order
+        * items in most recent order
+        * absolute difference in most recent and mean order cart size
+        * absolute difference in most recent and mean order hour of week
 
-# Save Pickles
-test_df.to_csv('pickle/test_df.csv')
-var_to_pickle(gbm, 'pickle/model_gbm.pk')
-var_to_pickle(lr, 'pickle/model_lr.pk')
-print('Saved Pickle Files')
-'''
+        Args:
+            None
+
+        Returns:
+            bool: None if successful, True if an error occurred
+        '''
+        feat_df = (self.newest_df.groupby('user_id')
+                                 .agg({'order_dow':'first',
+                                       'order_hour_of_day':'first',
+                                       'add_to_cart_order':'max'})
+                                 .rename(columns={'add_to_cart_order':
+                                                  'newest_cart_size'})
+        )
+        feat_df['newest_hour_of_week'] = (feat_df['order_dow'] * 24 +
+                                          feat_df['order_hour_of_day'])
+        feat_df.drop(['order_dow', 'order_hour_of_day'], axis=1, inplace=True)
+
+        df = self.df.merge(feat_df, how='left', on=['user_id'])
+        df['cart_size_difference'] = np.abs(df['mean_cart_size'] -
+                                            df['newest_cart_size'])
+        df['hour_of_week_difference'] = np.abs(df['mean_hour_of_week'] -
+                                               df['newest_hour_of_week'])
+        self.df = df
+        return None
+
+    def train_test_split(self):
+        '''
+        Splits dataframe into train and test sets, removes unused predictor
+        columns, and applies MinMax scaler to predictor values
+
+        Args:
+            None
+
+        Returns:
+            bool: None if successful, True if an error occurred
+        '''
+        train_df, test_df =\
+        train_test_by_group(self.df, self.id_col, test_size=.1, seed=29)
+
+        # Scales features
+        scl = MinMaxScaler()
+        X_train = scl.fit_transform(train_df[self.x_cols].values)
+        X_test = scl.transform(test_df[self.x_cols].values)
+
+        # Recombines feature-scaled training set dataframe
+        train_df.reset_index(drop=True, inplace=True)
+        train_df = train_df[[self.id_col, self.y_col]]
+        temp_df = pd.DataFrame(X_train, columns=self.x_cols)
+        self.train_df = pd.concat([train_df, temp_df], axis=1)
+
+        # Recombines feature-scaled test set dataframe
+        test_df.reset_index(drop=True, inplace=True)
+        test_df = test_df[[self.id_col, self.y_col]]
+        temp_df = pd.DataFrame(X_test, columns=self.x_cols)
+        self.test_df = pd.concat([test_df, temp_df], axis=1)
+        return None
+
+    def model_log_reg(self):
+        '''
+        Trains a logistic regression model
+
+        Args:
+            None
+
+        Returns:
+            bool: None if successful, True if an error occurred
+        '''
+        self.lrm = LogisticRegression(C=10,
+                                      solver='lbfgs',
+                                      multi_class='auto',
+                                      max_iter=2000)
+        self.lrm.fit(self.train_df[self.x_cols], self.train_df[self.y_col])
+        return None
+
+    def model_grad_boost(self):
+        '''
+        Trains a gradient boosting decision tree model
+
+        Args:
+            None
+
+        Returns:
+            bool: None if successful, True if an error occurred
+        '''
+        self.gbm = xgb.XGBClassifier(n_estimators=10000,
+                                     max_depth=3,
+                                     objective="binary:logistic",
+                                     learning_rate=.5,
+                                     subsample=.08,
+                                     min_child_weight=.5,
+                                     colsample_bytree=.8)
+        self.gbm.fit(self.train_df[self.x_cols], self.train_df[self.y_col],
+                     eval_set=[(self.train_df[self.x_cols],
+                                self.train_df[self.y_col])],
+                     eval_metric='auc',
+                     early_stopping_rounds=20,
+                     verbose=False)
+        return None
+
+    def save_to_files(self):
+        '''
+        Saves test set to csv and models to pickle files
+
+        Args:
+            None
+
+        Returns:
+            bool: None if successful, True if an error occurred
+        '''
+        # Creates a directory in which to save data if necessary
+        script_path = os.path.dirname(os.path.realpath(__file__))
+        data_dir = os.path.join(os.path.dirname(script_path[:-1]), 'data')
+        if not os.path.isdir(data_dir):
+            os.mkdir(data_dir)
+
+        # Saves files
+        self.test_df.to_csv(os.path.join(data_dir, 'test_df.csv'))
+        var_to_pickle(self.gbm, os.path.join(data_dir, 'model_gbm.pk'))
+        var_to_pickle(self.lrm, os.path.join(data_dir, 'model_lrm.pk'))
+        return None
+
+
+if __name__ == '__main__':
+    bm = build_models()
