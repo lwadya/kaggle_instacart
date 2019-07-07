@@ -41,3 +41,12 @@ I also calculated mean per-user F1 scores that more closely match the metric of 
 | Gradient Boosting Trees | 0.368             |
 
 ### Results
+
+The charts below show the most influential predictors and their respective coefficient values for each model. The logistic regression model relies heavily upon information about the size of the most recent cart, while the gradient boosting decision trees model gives far more weight to the contents of a user's previous orders. If information about the most recent cart were not available, the gradient boosting model would most likely outperform the logistic regression model.
+
+![logistic regression model coefficients](img/lrm_coef.png)
+![gradient boosting decision trees model coefficients](img/gbm_coef.png)
+
+### Conclusions
+
+This project was all about feature creation - the more features I engineered the better my models performed. At Metis I had a pretty tight deadline to get everything done and as a result did not incorporate all of the predictors I wanted to. I plan to eventually circle back and add more, including implementing some ideas from the Kaggle contest winners.
