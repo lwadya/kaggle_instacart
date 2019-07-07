@@ -4,7 +4,7 @@ I built models to classify whether or not items in a user's order history will b
 
 ### Feature Engineering
 
-I spent the majority of my time on this project engineering features from the basic dataset. After creating several features, I tested different combinations of them on a small subset of the data in order to eliminate any that seemed to have no effect on model output. After paring down features I ended up training and testing my final models on the following columns:
+I spent the majority of my time on this project engineering features from the basic dataset. After creating several features, I tested different combinations of them on a small subset of the data in order to eliminate any that seemed to have no effect on model output. After paring down features I ended up training and testing my final models on the following predictors:
 * **percent_in_user_orders**: Percent of a user's orders in which an item appears
 * **percent_in_all_orders**: Percent of all orders in which an item appears
 * **in_last_cart**: 1 if an item appears in a user's most recent prior order, 0 if not
@@ -23,3 +23,21 @@ I spent the majority of my time on this project engineering features from the ba
 * **newest_hour_of_week**: Hour of the week that the most recent order was placed
 * **cart_size_difference**: Absolute value of the difference between the average size of the orders containing an item and the size of the most recent order
 * **hour_of_week_difference**: Absolute value of the difference between the average hour of the week in which a user purchases an item and the hour of the week of the most recent order
+
+### Models
+
+In my preliminary tests using subsets of the Instacart data, I trained a number of different models: logistic regression, gradient boosting decision trees, random forest, and KNN. After several rounds of testing, I took the two that performed best, logistic regression and gradient boosting trees, and trained them on the full data set, minus a holdout test set. I used F1 score as my evaluation metric because I wanted the models to balance precision and recall in predicting which previously ordered items would appear in the newest orders. To account for the large class imbalance caused by the majority of previously ordered items not being in the most recent orders, I created adjusted probability threshold F1 scores as well. The scores below treat each dataframe row, which represents an item ordered by a specific user, as a separate, equally-weighted entity. Both models performed similarly with the gradient boosting trees classifier achieving slightly higher scores:
+
+| Model                   | Raw F1 Score | Adjusted F1 Score |
+| ----------------------- | ------------ | ----------------- |
+| Logistic Regression     | 0.313        | 0.447             |
+| Gradient Boosting Trees | 0.338        | 0.461             |
+
+I also calculated mean per-user F1 scores that more closely match the metric of the original Kaggle contest. If either model were incorporated into a recommendation engine the user-based metric would better represent its performance. In these F1 scores, model performance is virtually identical:
+
+| Model                   | Per-User F1 Score |
+| ----------------------- | ----------------- |
+| Logistic Regression     | 0.367             |
+| Gradient Boosting Trees | 0.368             |
+
+### Results
